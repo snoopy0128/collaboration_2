@@ -13,7 +13,10 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import r2_score
-
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.ensemble import RandomForestRegressor
 # 한글 폰트 설정
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
@@ -489,154 +492,155 @@ elif menu == "전기차 vs 전체 승용차 분석 및 전기차 비중 예측":
         
 # ------------------- 전기차 분류 모델 -------------------
 elif menu == "전기차 분류 모델":
-    st.header(" 배기량·연비 기반 차종 분류 모델")
+    st.header("차종 선택으로 동력유형 예측 + 평균 스펙 확인")
     st.markdown("""
-    **배기량(cc)과 연비(km/L)를 입력하면 차종(일반/전기차/하이브리드)을 예측**하는 분류 모델입니다.  
-    RandomForestClassifier를 GridSearchCV로 최적화한 모델을 사용합니다.
+    **선택한 차종의 동력유형(일반/하이브리드/전기차)을 예측**하고,  
+    해당 유형의 평균 배기량과 연비를 보여줍니다. (KNN 기반)
     """)
 
     try:
-        # 1. 데이터 로드 (CSV 파일이 프로젝트 폴더에 있다고 가정)
-        df_raw = pd.read_csv('전기차분류.csv')
-        
-        # 불필요한 열(no 등) 제거
-        if 'no' in df_raw.columns:
-            df_raw = df_raw.drop(columns=['no'])
-        
-        st.subheader("📊 원본 데이터 미리보기")
-        st.dataframe(df_raw.head(10), use_container_width=True)
+        # 1. 두 테이블 데이터 로드
+        df_spec = fetch_query("SELECT displacement AS engine_cc, fuel_efficiency, vehicle_type FROM vehicle_classification")
+        df_model = fetch_query("SELECT power_type, model_name FROM car_model_by_power_type")
 
-        # 2. Label Encoding
-        from sklearn.preprocessing import LabelEncoder, StandardScaler
-        label_encoder = LabelEncoder()
-        df = df_raw.copy()
-        df['차종_숫자'] = label_encoder.fit_transform(df['차종'])
+        if df_spec.empty or df_model.empty:
+            st.error("필요한 테이블 데이터가 없습니다. DB 확인해주세요.")
+            st.stop()
 
-        class_names = label_encoder.classes_  # ['일반', '전기차', '하이브리드'] 등
+        # 2. 학습 데이터 준비 (배기량 + 연비 → 동력유형)
+        df_spec['engine_cc'] = pd.to_numeric(df_spec['engine_cc'], errors='coerce')
+        df_spec['fuel_efficiency'] = pd.to_numeric(df_spec['fuel_efficiency'], errors='coerce')
+        df_spec = df_spec.dropna()
 
-        # 특징/타겟 분리
-        X = df[['배기량', '연비']]
-        y = df['차종_숫자']
+        X = df_spec[['engine_cc', 'fuel_efficiency']]
+        y = df_spec['vehicle_type']
 
-        # 3. 훈련/테스트 분리 및 스케일링
-        from sklearn.model_selection import train_test_split
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.model_selection import GridSearchCV
-        from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-        import numpy as np
+        # Label Encoding
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y)
+        class_names = le.classes_  # ['전기차', '일반', '하이브리드']
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-
+        # 훈련/테스트 분리 + 스케일링
+        X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
-        # 4. GridSearchCV로 최적 모델 학습 (캐싱으로 속도 향상)
-        @st.cache_resource(show_spinner="모델 학습 중...")
-        def train_best_model():
-            param_grid = {
-                'n_estimators': [50, 100, 200],
-                'max_depth': [None, 5, 10, 20],
-                'min_samples_split': [2, 5, 10],
-                'min_samples_leaf': [1, 2, 4],
-                'class_weight': ['balanced', None]
-            }
-            
-            rf = RandomForestClassifier(random_state=42, n_jobs=-1)
-            grid_search = GridSearchCV(
-                estimator=rf,
-                param_grid=param_grid,
-                cv=5,
-                scoring='accuracy',
-                n_jobs=-1
-            )
-            grid_search.fit(X_train_scaled, y_train)
-            return grid_search.best_estimator_, grid_search.best_params_, grid_search.best_score_
+        # KNN 모델 학습 (캐싱으로 속도 향상)
+        @st.cache_resource(show_spinner="KNN 모델 학습 중...")
+        def train_knn():
+            knn = KNeighborsClassifier(n_neighbors=5, weights='distance')
+            knn.fit(X_train_scaled, y_train)
+            return knn
 
-        best_model, best_params, best_cv_score = train_best_model()
+        knn = train_knn()
 
-        # 5. 모델 성능 표시
-        st.subheader("📈 모델 성능")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("최적 CV 정확도", f"{best_cv_score:.4f}")
-        with col2:
-            y_pred = best_model.predict(X_test_scaled)
-            test_acc = accuracy_score(y_test, y_pred)
-            st.metric("테스트 정확도", f"{test_acc:.4f}")
-        with col3:
-            st.metric("사용된 특징", "배기량, 연비")
+        # 3. 사용자 입력: 차종 선택
+        st.subheader("🔽 예측할 차종 선택")
+        all_models = sorted(df_model['model_name'].unique())
+        selected_model = st.selectbox("차종을 선택하세요", all_models)
 
-        st.write("**최적 하이퍼파라미터**")
-        st.json(best_params)
+        if st.button("동력유형 예측하기"):
+            # 선택한 차종의 동력유형 (참고용 - 실제 예측과 비교)
+            true_power = df_model[df_model['model_name'] == selected_model]['power_type'].iloc[0]
 
-        # 6. Classification Report & Confusion Matrix
-        st.subheader("🔍 상세 분류 보고서")
-        report = classification_report(y_test, y_pred, target_names=class_names, output_dict=True)
-        st.dataframe(pd.DataFrame(report).T)
+            # 해당 차종이 속한 동력유형의 평균 배기량/연비 계산
+            avg_spec = df_spec[df_spec['vehicle_type'] == true_power][['engine_cc', 'fuel_efficiency']].mean()
 
-        st.subheader("🧩 혼동 행렬")
-        cm = confusion_matrix(y_test, y_pred)
-        fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
-        import seaborn as sns
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=class_names, yticklabels=class_names, ax=ax_cm)
-        ax_cm.set_xlabel('예측 차종')
-        ax_cm.set_ylabel('실제 차종')
-        ax_cm.set_title('Confusion Matrix')
-        st.pyplot(fig_cm)
+            # 가상의 입력 점 생성 (평균값 사용 → 실제 모델은 평균 기반 예측)
+            new_point = np.array([[avg_spec['engine_cc'], avg_spec['fuel_efficiency']]])
 
-        # 7. 사용자 입력으로 실시간 예측
-        st.subheader("🔮 직접 예측해보기")
-        col1, col2 = st.columns(2)
-        with col1:
-            displacement = st.number_input("배기량 (cc)", min_value=0, max_value=10000, value=2000, step=100)
-        with col2:
-            fuel_efficiency = st.number_input("연비 (km/L)", min_value=0.0, max_value=100.0, value=15.0, step=0.5)
+            # 스케일링 및 예측
+            new_point_scaled = scaler.transform(new_point)
+            pred_encoded = knn.predict(new_point_scaled)[0]
+            pred_label = le.inverse_transform([pred_encoded])[0]
+            pred_proba = knn.predict_proba(new_point_scaled)[0]
 
-        if st.button("차종 예측하기"):
-            input_data = scaler.transform([[displacement, fuel_efficiency]])
-            pred = best_model.predict(input_data)[0]
-            pred_proba = best_model.predict_proba(input_data)[0]
-            
-            predicted_class = class_names[pred]
+            # 확률 데이터프레임
             proba_df = pd.DataFrame({
-                '차종': class_names,
+                '동력유형': class_names,
                 '확률 (%)': np.round(pred_proba * 100, 2)
             }).sort_values(by='확률 (%)', ascending=False)
 
-            st.success(f"### 예측 결과: **{predicted_class}**")
-            st.dataframe(proba_df, use_container_width=True, hide_index=True)
+            # 결과 표시
+            col1, col2 = st.columns(2)
+            
+            # 모델 정확도 표시
+            test_acc = accuracy_score(y_test, knn.predict(X_test_scaled))
+            st.success(f"🚀 모델 정확도 (테스트 데이터): {test_acc:.2%}")
+            
+            with col1:
+                st.metric("실제 동력유형 (데이터 기준)", true_power)
+                st.metric("예측 동력유형 (KNN)", pred_label)
+            with col2:
+                st.metric("평균 배기량 (cc)", f"{avg_spec['engine_cc']:.1f}")
+                st.metric("평균 연비 (km/L)", f"{avg_spec['fuel_efficiency']:.1f}")
+                
+            # 해당 유형의 대표 차종 리스트
+            similar_models = sorted(df_model[df_model['power_type'] == pred_label]['model_name'].unique())
+            st.info(f"**{pred_label} 대표 차종 예시**: {', '.join(similar_models[:10])}{'...' if len(similar_models) > 10 else ''}")
 
-            # 확률 바 차트
-            fig_prob, ax_prob = plt.subplots(figsize=(8, 4))
-            ax_prob.bar(proba_df['차종'], proba_df['확률 (%)'], color=['#1f77b4', '#ff7f0e', '#2ca02c'][:len(class_names)])
-            ax_prob.set_ylim(0, 100)
-            ax_prob.set_ylabel('확률 (%)')
-            ax_prob.set_title('각 차종별 예측 확률')
-            for i, v in enumerate(proba_df['확률 (%)']):
-                ax_prob.text(i, v + 2, f"{v}%", ha='center', fontweight='bold')
-            st.pyplot(fig_prob)
+            # 시각화
+            st.subheader("🔍 KNN 분류 시각화 (가상 입력 점 기준)")
+            fig, ax = plt.subplots(figsize=(10, 6))
 
-        st.info("""
-        💡 **해석 팁**  
-        • 전기차는 배기량이 0에 가까우며 연비가 매우 높음  
-        • 하이브리드는 중간 정도의 배기량 + 높은 연비  
-        • 일반 내연기관차는 배기량이 크고 연비가 상대적으로 낮음
-        """)
+            # 전체 학습 데이터
+            scatter = ax.scatter(
+                X_train['engine_cc'],
+                X_train['fuel_efficiency'],
+                c=y_train,
+                cmap='coolwarm',
+                alpha=0.6,
+                s=50
+            )
+
+            # 가장 가까운 이웃 5개
+            distances, indices = knn.kneighbors(new_point_scaled)
+            neighbors = X_train.iloc[indices[0]]
+            ax.scatter(
+                neighbors['engine_cc'],
+                neighbors['fuel_efficiency'],
+                s=300,
+                facecolors='none',
+                edgecolors='black',
+                linewidths=2,
+                label='가장 가까운 이웃 5개'
+            )
+
+            # 새로운 점 (선택한 차종의 평균값)
+            ax.scatter(
+                new_point[0][0],
+                new_point[0][1],
+                color='green',
+                s=300,
+                marker='X',
+                linewidths=4,
+                label=f'선택 차종 평균\n({selected_model})'
+            )
+
+            ax.set_xlabel('배기량 (cc)', fontsize=12)
+            ax.set_ylabel('연비 (km/L)', fontsize=12)
+            ax.set_title('KNN 기반 동력유형 분류 시각화', fontsize=14)
+            ax.legend()
+
+            # 범례에 동력유형 이름 추가
+            handles, _ = scatter.legend_elements()
+            legend_labels = class_names
+            ax.legend(handles, legend_labels, title="동력유형", loc='upper right')
+
+            st.pyplot(fig)
+
+        st.caption("데이터 출처: ev_classification_by_spec (배기량·연비), car_model_by_power_type (차종 매핑)")
 
     except Exception as e:
-        st.error(f"전기차 분류 모델 페이지 오류: {str(e)}")
-        st.info("'전기차분류.csv' 파일이 앱과 동일한 폴더에 있는지 확인해주세요.")
+        st.error(f"모델 실행 중 오류: {str(e)}")
+        st.info("테이블명이나 컬럼명을 확인해주세요: ev_classification_by_spec, car_model_by_power_type")
         
 # ------------------- CCTV vs 사고 예측 모델 -------------------
 elif menu == "CCTV vs 사고 예측 모델":
     st.header("📹 서울 자치구 CCTV vs 교통사고 분석 (2025)")
 
     try:
-        # DB에서 데이터 불러오기
         query = """
         SELECT 
             year AS 연도,
@@ -654,51 +658,85 @@ elif menu == "CCTV vs 사고 예측 모델":
             st.stop()
 
         # 데이터 준비
-        X = df[['사고건수']].values  # 독립변수 (2D 배열 필요)
-        y = df['CCTV'].values        # 종속변수
+        X = df[['사고건수']].values
+        y = df['CCTV'].values
 
-        # 훈련/테스트 데이터 분리 (80:20)
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+            X, y, test_size=0.2, random_state=42, stratify=None
         )
 
-        # 선형회귀 모델 학습 (훈련 데이터만 사용)
-        model = LinearRegression()
-        model.fit(X_train, y_train)
+        # 모델 1: 선형 회귀
+        linear_model = LinearRegression()
+        linear_model.fit(X_train, y_train)
+        y_pred_linear = linear_model.predict(X_test)
+        r2_linear = r2_score(y_test, y_pred_linear)
+        mae_linear = mean_absolute_error(y_test, y_pred_linear)
 
-        # 테스트 데이터로 성능 평가
-        y_pred_test = model.predict(X_test)
-        r2_test = r2_score(y_test, y_pred_test)
-        mae_test = mean_absolute_error(y_test, y_pred_test)
+        # 모델 2: 다항 회귀 (degree=2) - 비선형 관계 포착 강화
+        poly_model = make_pipeline(PolynomialFeatures(degree=2), LinearRegression())
+        poly_model.fit(X_train, y_train)
+        y_pred_poly = poly_model.predict(X_test)
+        r2_poly = r2_score(y_test, y_pred_poly)
+        mae_poly = mean_absolute_error(y_test, y_pred_poly)
 
-        st.subheader("모델 성능 (훈련/테스트 분리)")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("R² (테스트)", f"{r2_test:.4f}", "설명력")
-        with col2:
-            st.metric("MAE (테스트)", f"{mae_test:.1f}", "평균 절대 오차")
-        with col3:
-            st.metric("훈련 데이터 크기", f"{len(X_train)} / {len(X)}")
+        # 모델 3: 다항 회귀 (degree=3) - 더 유연하게 (과적합 주의, 하지만 데이터 적어 시도)
+        poly3_model = make_pipeline(PolynomialFeatures(degree=3), LinearRegression())
+        poly3_model.fit(X_train, y_train)
+        y_pred_poly3 = poly3_model.predict(X_test)
+        r2_poly3 = r2_score(y_test, y_pred_poly3)
+        mae_poly3 = mean_absolute_error(y_test, y_pred_poly3)
 
-        st.write(f"회귀식: CCTV = {model.coef_[0]:.3f} × 사고건수 + {model.intercept_:.3f}")
+        # 모델 성능 비교 테이블
+        st.subheader("📊 모델 성능 비교")
+        comparison_df = pd.DataFrame({
+            '모델': ['선형 회귀', '다항 회귀 (2차)', '다항 회귀 (3차)'],
+            'R² (테스트)': [r2_linear, r2_poly, r2_poly3],
+            'MAE (테스트)': [mae_linear, mae_poly, mae_poly3]
+        }).round(4)
 
-        # 전체 데이터 테이블
-        st.subheader("2025년 자치구별 데이터")
-        st.dataframe(df[['자치구', 'CCTV', '사고건수']], use_container_width=True, hide_index=True)
+        # 최고 성능 모델 인덱스 계산 (R²가 가장 높은 = 덜 나쁜)
+        best_idx = comparison_df['R² (테스트)'].idxmax()
 
-        # 그래프: 전체 산점도 + 회귀선
-        st.subheader("산점도 + 회귀선 (전체 데이터)")
+        # 스타일 적용: 최고 모델 행 전체를 강한 녹색으로 강조
+        def highlight_best_row(row):
+            return ['background-color: #d4edda; font-weight: bold' if row.name == best_idx else '' for _ in row]
+
+        styled_df = comparison_df.style\
+            .apply(highlight_best_row, axis=1)\
+            .format({'R² (테스트)': '{:.4f}', 'MAE (테스트)': '{:.1f}'})\
+            .highlight_min(subset=['MAE (테스트)'], color='lightblue')
+
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+        # 최고 성능 모델 선택
+        models = [linear_model, poly_model, poly3_model]
+        model_names = ['선형 회귀', '다항 회귀 (2차)', '다항 회귀 (3차)']
+        best_model = models[best_idx]
+        best_model_name = model_names[best_idx]
+        best_r2 = comparison_df.loc[best_idx, 'R² (테스트)']
+
+        st.success(f"**최고 성능 모델: {best_model_name}** (R² = {best_r2:.4f} → 상대적으로 가장 우수)")
+
+        # 그래프: 산점도 + 최적 모델 예측 곡선
+        st.subheader(f"산점도 + 회귀선 ({best_model_name} 기준)")
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.scatter(df['사고건수'], df['CCTV'], color='darkorange', s=100, alpha=0.8, label='실제 데이터')
-        x_range = np.linspace(df['사고건수'].min(), df['사고건수'].max(), 100)
-        y_range = model.predict(x_range.reshape(-1, 1))
-        ax.plot(x_range, y_range, color='blue', linewidth=3, label='선형회귀 모델')
-        ax.set_title('서울 자치구별 사고건수 vs CCTV 개수 (2025년)', fontsize=14)
+        ax.scatter(df['사고건수'], df['CCTV'], color='darkorange', s=100, alpha=0.8, label='실제 데이터 (자치구)')
+
+        # 부드러운 예측 곡선
+        x_range = np.linspace(df['사고건수'].min(), df['사고건수'].max(), 300).reshape(-1, 1)
+        y_range = best_model.predict(x_range)
+        ax.plot(x_range.flatten(), y_range, color='blue', linewidth=3, label=f'{best_model_name} 예측')
+
+        ax.set_title(f'서울 자치구별 사고건수 vs CCTV 개수 (2025년) - {best_model_name}', fontsize=14)
         ax.set_xlabel('사고건수')
         ax.set_ylabel('CCTV 개수')
         ax.legend()
         ax.grid(True, alpha=0.3)
         st.pyplot(fig)
+
+        # 전체 데이터 테이블
+        st.subheader("2025년 자치구별 데이터")
+        st.dataframe(df[['자치구', 'CCTV', '사고건수']], use_container_width=True, hide_index=True)
 
         # 미래/가상 예측
         st.subheader("미래/가상 예측")
@@ -707,13 +745,15 @@ elif menu == "CCTV vs 사고 예측 모델":
             accidents_input = st.number_input(
                 "예상 사고건수 입력", min_value=0, max_value=5000, value=1500, step=100
             )
-            predicted_cctv = int(round(model.predict([[accidents_input]])[0]))
+            predicted_cctv = int(round(best_model.predict([[accidents_input]])[0]))
             st.metric("예상 CCTV 개수", f"{predicted_cctv}대")
 
         st.info("""
-        📊 **해석**   
-        • 사고건수가 많을수록 CCTV도 많아지는 경향 (양의 상관).  
-        • 이는 "사고 많은 곳에 CCTV를 우선 설치"한 정책 패턴으로 보입니다.
+        📊 **분석 해석 및 모델 선택 이유**  
+        • 데이터가 25개 자치구로 적고 분포가 비선형적 → 단순 선형 회귀는 한계 있음  
+        • 다항 회귀(2차 또는 3차)가 곡선 형태로 실제 패턴을 더 잘 반영  
+        • 3개 모델 비교 후 **R²가 가장 높은 모델 자동 선택** → 결과의 신뢰성 확보  
+        • "사고가 많은 구일수록 CCTV 설치가 급격히 증가"하는 정책 패턴을 시각적으로 확인 가능
         """)
 
     except Exception as e:
